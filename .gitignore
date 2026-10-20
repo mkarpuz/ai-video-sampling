@@ -1,0 +1,36 @@
+# Private configuration and credentials
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+*.pem
+*.key
+*service-account*.json
+*credentials*.json
+
+# Collected data, transcripts, and backups
+csv/
+data/
+exports/
+transcripts/
+backups/
+*.csv
+*.csv.gz
+*.parquet
+*.jsonl
+*.jsonl.gz
+*.dump
+*.sql.gz
+
+# Existing exploratory notebooks
+/supadata_youtube_search.ipynb
+/csv_basic_exploration.ipynb
+.ipynb_checkpoints/
+
+# Python and macOS files
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
