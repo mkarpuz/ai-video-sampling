@@ -1,0 +1,7 @@
+# Only these public files are sent to the image builder.
+**
+!Dockerfile
+!requirements.txt
+!database.py
+!pipeline.py
+!settings.json

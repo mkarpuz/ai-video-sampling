@@ -26,9 +26,35 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  worker:
+    build: .
+    profiles: ["tools"]
+    mem_limit: 256m
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGDATABASE: ${POSTGRES_DB:?Missing POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER:?Missing POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Missing POSTGRES_PASSWORD}
+      SUPADATA_API_KEY: ${SUPADATA_API_KEY:-}
+    volumes:
+      - ./data:/app/data
+      - ./settings.json:/app/settings.json:ro
+    networks:
+      - backend
+      - outbound
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   postgres_data:
 
 networks:
   backend:
     internal: true
+  outbound:
