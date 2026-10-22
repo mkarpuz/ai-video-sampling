@@ -6,6 +6,13 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 
+WORKER_LOCK = 752041004
+
+
+class BudgetExceeded(RuntimeError):
+    """The next request would exceed the monthly discovery allowance."""
+
+
 SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS search_runs (
@@ -43,6 +50,11 @@ SCHEMA = (
         PRIMARY KEY (run_id, video_id)
     )
     """,
+    """ALTER TABLE search_runs
+       ADD COLUMN IF NOT EXISTS strategy TEXT,
+       ADD COLUMN IF NOT EXISTS scheduled_for DATE""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS search_runs_strategy_date
+       ON search_runs (strategy, scheduled_for)""",
 )
 
 
@@ -53,15 +65,55 @@ def init_db(conn):
             conn.execute(statement)
 
 
-def start_run(conn, settings):
+def monthly_usage(conn, timezone):
+    """Count requests conservatively within the local calendar month."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        return cur.execute(
+            """WITH period AS (
+                   SELECT date_trunc('month', now() AT TIME ZONE %s) AS start
+               )
+               SELECT COALESCE(sum(GREATEST(estimated_credits,
+                      COALESCE(billed_credits, 0))), 0) AS credits
+               FROM search_runs, period
+               WHERE started_at >= (period.start AT TIME ZONE %s)
+                 AND started_at < ((period.start + interval '1 month') AT TIME ZONE %s)""",
+            (timezone, timezone, timezone),
+        ).fetchone()["credits"]
+
+
+def scheduled_run(conn, strategy, day):
+    """Find an existing attempt for one strategy and date."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        return cur.execute(
+            "SELECT run_id, status FROM search_runs WHERE strategy = %s AND scheduled_for = %s",
+            (strategy, day),
+        ).fetchone()
+
+
+def start_run(conn, settings, *, monthly_cap, timezone, strategy=None, scheduled_for=None):
     """Record the settings before a paid request and return its run ID."""
     run_id = uuid4()
     estimated_credits = (settings["limit"] + 19) // 20
     with conn.transaction():
+        # Serialize the budget check and reservation, including manual searches.
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (WORKER_LOCK,))
+        if (strategy is None) != (scheduled_for is None):
+            raise ValueError("A scheduled run needs both a strategy and a date.")
+        if strategy is not None:
+            previous = scheduled_run(conn, strategy, scheduled_for)
+            if previous:
+                if previous["status"] == "complete":
+                    return None
+                raise RuntimeError(f"Review or resume existing run {previous['run_id']}.")
+        used = monthly_usage(conn, timezone)
+        if used + estimated_credits > monthly_cap:
+            raise BudgetExceeded(f"{used} credits reserved; next request needs {estimated_credits}; "
+                                 f"monthly cap is {monthly_cap}.")
         conn.execute(
-            """INSERT INTO search_runs (run_id, settings, estimated_credits)
-               VALUES (%s, %s, %s)""",
-            (run_id, Jsonb(settings), estimated_credits),
+            """INSERT INTO search_runs
+                   (run_id, settings, estimated_credits, strategy, scheduled_for)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (run_id, Jsonb(settings), estimated_credits, strategy, scheduled_for),
         )
     return run_id
 

@@ -1,0 +1,34 @@
+{
+  "timezone": "Europe/Berlin",
+  "monthly_credit_cap": 1000,
+  "strategies": [
+    {
+      "name": "today-relevance",
+      "frequency": "daily",
+      "uploadDate": "today",
+      "sortBy": "relevance",
+      "limit": 100
+    },
+    {
+      "name": "week-date",
+      "frequency": "daily",
+      "uploadDate": "week",
+      "sortBy": "date",
+      "limit": 200
+    },
+    {
+      "name": "month-views",
+      "frequency": "sunday",
+      "uploadDate": "month",
+      "sortBy": "views",
+      "limit": 1000
+    },
+    {
+      "name": "month-relevance",
+      "frequency": "sunday",
+      "uploadDate": "month",
+      "sortBy": "relevance",
+      "limit": 500
+    }
+  ]
+}

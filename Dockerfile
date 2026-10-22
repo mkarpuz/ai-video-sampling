@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY database.py pipeline.py settings.json ./
+COPY database.py pipeline.py settings.json schedule.json ./
 
 ENTRYPOINT ["python", "pipeline.py"]
 CMD ["--help"]

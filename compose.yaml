@@ -42,6 +42,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./settings.json:/app/settings.json:ro
+      - ./schedule.json:/app/schedule.json:ro
     networks:
       - backend
       - outbound

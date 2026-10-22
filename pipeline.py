@@ -30,7 +30,7 @@ EXPORT_QUERIES = {
         FROM videos ORDER BY first_seen_at, video_id
     """,
     "search_history.csv": """
-        SELECT run_id, started_at, finished_at, status,
+        SELECT run_id, started_at, finished_at, status, strategy, scheduled_for,
                settings->>'query' AS query, settings->>'type' AS type,
                settings->>'uploadDate' AS "uploadDate",
                settings->>'sortBy' AS "sortBy", settings->>'duration' AS duration,
@@ -52,9 +52,10 @@ EXPORT_QUERIES = {
 }
 
 
-def load_settings():
+def load_settings(settings=None):
     """Reject invalid settings before making a paid request."""
-    settings = json.loads((ROOT / "settings.json").read_text())
+    if settings is None:
+        settings = json.loads((ROOT / "settings.json").read_text())
     choices = {
         "type": ("video",),
         "uploadDate": ("all", "hour", "today", "week", "month", "year"),
@@ -82,6 +83,35 @@ def load_settings():
     return settings
 
 
+def load_schedule():
+    """Validate every strategy before the first paid request."""
+    plan = json.loads((ROOT / "schedule.json").read_text())
+    if not isinstance(plan, dict) or set(plan) != {"timezone", "monthly_credit_cap", "strategies"}:
+        raise ValueError("schedule.json needs timezone, monthly_credit_cap and strategies.")
+    cap = plan["monthly_credit_cap"]
+    if type(cap) is not int or cap < 1:
+        raise ValueError("monthly_credit_cap must be a positive integer.")
+    if not isinstance(plan["timezone"], str) or not plan["timezone"].strip():
+        raise ValueError("timezone must be a timezone name, such as Europe/Berlin.")
+    if not isinstance(plan["strategies"], list) or not plan["strategies"]:
+        raise ValueError("Provide at least one strategy.")
+    base = load_settings()
+    names = set()
+    for strategy in plan["strategies"]:
+        if not isinstance(strategy, dict) or not set(strategy) <= set(base) | {"name", "frequency"}:
+            raise ValueError("A strategy contains unknown parameters.")
+        name = strategy.get("name")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise ValueError("Every strategy needs a distinct, nonempty name.")
+        names.add(name)
+        if strategy.get("frequency") not in ("daily", "sunday"):
+            raise ValueError("frequency must be daily or sunday.")
+        strategy["settings"] = load_settings(base | {
+            key: value for key, value in strategy.items() if key not in ("name", "frequency")
+        })
+    return plan
+
+
 def save_checkpoint(run_id, response, billed_credits):
     """Keep the response on disk until its database transaction succeeds."""
     path = PENDING / f"{run_id}.json"
@@ -94,9 +124,10 @@ def save_checkpoint(run_id, response, billed_credits):
     return path
 
 
-def run_search(conn):
+def run_search(conn, settings=None, *, plan=None, strategy=None, scheduled_for=None):
     """Make one request. A failed request is never automatically repeated."""
-    settings = load_settings()
+    settings = load_settings(settings)
+    plan = load_schedule() if plan is None else plan
     api_key = os.environ.get("SUPADATA_API_KEY")
     if not api_key or not api_key.strip():
         raise ValueError("Set SUPADATA_API_KEY in the private environment.")
@@ -104,7 +135,12 @@ def run_search(conn):
     if any(PENDING.glob("*.json")):
         raise RuntimeError("Resume the response in data/pending before another search.")
 
-    run_id = database.start_run(conn, settings)
+    run_id = database.start_run(
+        conn, settings, monthly_cap=plan["monthly_credit_cap"], timezone=plan["timezone"],
+        strategy=strategy, scheduled_for=scheduled_for,
+    )
+    if run_id is None:
+        return {"status": "already_complete"}
     billed_credits = None
     try:
         response = requests.get(
@@ -127,6 +163,50 @@ def run_search(conn):
             logging.exception("Could not record failure for run %s", run_id)
         raise
     return {"run_id": str(run_id), **counts}
+
+
+def run_schedule(conn, dry_run=False):
+    """Run today's daily strategies and, on Sundays, the weekly strategies."""
+    plan = load_schedule()
+    day = conn.execute("SELECT (now() AT TIME ZONE %s)::date", (plan["timezone"],)).fetchone()[0]
+    used = database.monthly_usage(conn, plan["timezone"])
+    remaining = plan["monthly_credit_cap"] - used
+    report = {"date": str(day), "timezone": plan["timezone"], "dry_run": dry_run,
+              "monthly_cap": plan["monthly_credit_cap"], "reserved_before": used,
+              "ok": True, "strategies": []}
+    for strategy in plan["strategies"]:
+        settings = strategy["settings"]
+        cost = (settings["limit"] + 19) // 20
+        item = {"name": strategy["name"], "uploadDate": settings["uploadDate"],
+                "sortBy": settings["sortBy"], "limit": settings["limit"], "estimated_credits": cost}
+        report["strategies"].append(item)
+        if strategy["frequency"] == "sunday" and day.weekday() != 6:
+            item["status"] = "not_due"
+            continue
+        previous = database.scheduled_run(conn, strategy["name"], day)
+        if previous:
+            item["status"] = "already_complete" if previous["status"] == "complete" else "needs_review"
+            if item["status"] == "needs_review":
+                report["ok"] = False
+            continue
+        if dry_run:
+            item["status"] = "would_run" if cost <= remaining else "budget_limit"
+            if cost <= remaining:
+                remaining -= cost
+            continue
+        try:
+            item.update(run_search(conn, settings, plan=plan, strategy=strategy["name"],
+                                   scheduled_for=day))
+            item.setdefault("status", "complete")
+        except database.BudgetExceeded:
+            item["status"] = "budget_limit"
+        except Exception as error:
+            logging.exception("Scheduled strategy %s failed", strategy["name"])
+            item.update(status="failed", error=type(error).__name__)
+            report["ok"] = False
+    if not dry_run:
+        report["reserved_after"] = database.monthly_usage(conn, plan["timezone"])
+    return report
 
 
 def resume(conn, path):
@@ -165,12 +245,15 @@ def export_snapshot(conn):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("init", "search", "resume", "export"))
+    parser.add_argument("command", choices=("init", "search", "resume", "export", "schedule"))
+    parser.add_argument("--dry-run", action="store_true", help="Preview schedule without API requests")
     parser.add_argument("checkpoint", nargs="?", type=Path,
                         help="Path to data/pending/<run_id>.json; required for resume")
     args = parser.parse_args()
     if (args.command == "resume") != (args.checkpoint is not None):
         parser.error("Pass a checkpoint path only with resume.")
+    if args.dry_run and args.command != "schedule":
+        parser.error("--dry-run is only available with schedule.")
 
     # Private response files and logs stay inside the ignored data directory.
     os.umask(0o077)
@@ -182,6 +265,11 @@ def main():
         if missing:
             raise ValueError(f"Missing database environment variables: {', '.join(missing)}")
         with psycopg.connect(autocommit=True, connect_timeout=10) as conn:
+            if args.command in ("search", "schedule", "resume"):
+                locked = conn.execute("SELECT pg_try_advisory_lock(%s)",
+                                      (database.WORKER_LOCK,)).fetchone()[0]
+                if not locked:
+                    raise RuntimeError("Another collection command is running.")
             if args.command == "init":
                 database.init_db(conn)
                 print("Database tables are ready.")
@@ -189,6 +277,10 @@ def main():
                 print(json.dumps(run_search(conn)))
             elif args.command == "export":
                 print(json.dumps(export_snapshot(conn)))
+            elif args.command == "schedule":
+                report = run_schedule(conn, args.dry_run)
+                print(json.dumps(report, indent=2))
+                return 0 if report["ok"] else 1
             else:
                 print(json.dumps(resume(conn, args.checkpoint)))
     except Exception as error:
