@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 from uuid import UUID
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import psycopg
 import requests
@@ -18,6 +19,37 @@ import database
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 PENDING = DATA / "pending"
+
+EXPORT_QUERIES = {
+    "videos.csv": """
+        SELECT video_id AS id, metadata->>'title' AS title,
+               metadata->'channel'->>'name' AS channel,
+               metadata->>'viewCount' AS "viewCount",
+               metadata->>'uploadDate' AS "uploadDate",
+               metadata->>'duration' AS duration, first_seen_at, last_seen_at
+        FROM videos ORDER BY first_seen_at, video_id
+    """,
+    "search_history.csv": """
+        SELECT run_id, started_at, finished_at, status,
+               settings->>'query' AS query, settings->>'type' AS type,
+               settings->>'uploadDate' AS "uploadDate",
+               settings->>'sortBy' AS "sortBy", settings->>'duration' AS duration,
+               settings->'features' AS features,
+               (settings->>'limit')::integer AS requested_limit,
+               returned_count, unique_count, new_count, rejected_count,
+               estimated_credits, billed_credits
+        FROM search_runs ORDER BY started_at, run_id
+    """,
+    "search_results.csv": """
+        SELECT run_id, video_id AS id, result_rank, is_new,
+               metadata->>'title' AS title,
+               metadata->'channel'->>'name' AS channel,
+               metadata->>'viewCount' AS "viewCount",
+               metadata->>'uploadDate' AS "uploadDate",
+               metadata->>'duration' AS duration
+        FROM search_results ORDER BY run_id, result_rank
+    """,
+}
 
 
 def load_settings():
@@ -106,9 +138,34 @@ def resume(conn, path):
     return {"run_id": str(run_id), **counts}
 
 
+def export_snapshot(conn):
+    """Bundle private CSVs from the same database snapshot; no API request."""
+    folder = DATA / "exports"
+    folder.mkdir(exist_ok=True)
+    destination = folder / "snapshot.zip"
+    with tempfile.NamedTemporaryFile(dir=folder, suffix=".zip", delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                cur.execute("SET LOCAL TIME ZONE 'UTC'")
+                with ZipFile(file, "w", compression=ZIP_DEFLATED) as archive:
+                    for name, query in EXPORT_QUERIES.items():
+                        with archive.open(name, "w") as output:
+                            with cur.copy(f"COPY ({query}) TO STDOUT WITH CSV HEADER") as copy:
+                                for chunk in copy:
+                                    output.write(chunk)
+            file.flush()
+            os.fsync(file.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"snapshot": str(destination), "files": list(EXPORT_QUERIES)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("init", "search", "resume"))
+    parser.add_argument("command", choices=("init", "search", "resume", "export"))
     parser.add_argument("checkpoint", nargs="?", type=Path,
                         help="Path to data/pending/<run_id>.json; required for resume")
     args = parser.parse_args()
@@ -130,6 +187,8 @@ def main():
                 print("Database tables are ready.")
             elif args.command == "search":
                 print(json.dumps(run_search(conn)))
+            elif args.command == "export":
+                print(json.dumps(export_snapshot(conn)))
             else:
                 print(json.dumps(resume(conn, args.checkpoint)))
     except Exception as error:
